@@ -1,0 +1,709 @@
+```{r}
+library(TCGAbiolinks)
+library(dplyr)
+```
+
+Projects
+```{r}
+projects <- c("TCGA-LUAD", "TCGA-LUSC")
+```
+
+```{r}
+clinical_list <- list()
+
+for (proj in projects) {
+  message("Downloading clinical for: ", proj)
+  
+  # THIS is the correct function for clinical data
+  clin <- GDCquery_clinic(project = proj, type = "clinical")
+  
+  clin$project <- proj
+  
+  # Check which ID column exists in YOUR version
+  id_col <- intersect(c("submitter_id", "bcr_patient_barcode"), names(clin))[1]
+  
+  # Create patient ID from whichever column exists
+  clin$patient_id <- substr(clin[[id_col]], 1, 12)
+  
+  clinical_list[[proj]] <- clin
+}
+
+clinical_all <- bind_rows(clinical_list)
+
+# Remove duplicates
+clinical_all <- clinical_all %>% distinct(patient_id, .keep_all = TRUE)
+
+write.csv(clinical_all, "clinical_cleaned.csv", row.names = FALSE)
+```
+
+
+
+```{r}
+library(dplyr)
+
+# Find list columns
+list_cols <- sapply(clinical_all, is.list)
+
+# Convert each list column to a single character string
+clinical_flat <- clinical_all %>%
+  mutate(across(which(list_cols),
+                ~ sapply(., function(x) paste(unlist(x), collapse = ";"))))
+
+# Now this will work
+write.csv(clinical_flat, "clinical_cleaned.csv", row.names = FALSE)
+
+```
+
+RNA-Seq Data
+
+```{r}
+library(TCGAbiolinks)
+library(dplyr)
+
+# Same projects as before
+projects <- c("TCGA-LUAD", "TCGA-LUSC")
+
+# Patient IDs from your cleaned clinical table
+patients <- clinical_flat$patient_id   # or clinical_all$patient_id
+
+```
+
+```{r}
+if (!requireNamespace("SummarizedExperiment", quietly = TRUE)) {
+  if (!requireNamespace("BiocManager", quietly = TRUE)) {
+    install.packages("BiocManager")
+  }
+  BiocManager::install("SummarizedExperiment")
+}
+
+```
+
+```{r}
+query_rna <- GDCquery(
+  project       = projects,
+  data.category = "Transcriptome Profiling",
+  data.type     = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts",   # <-- required based on your message
+  barcode       = patients
+)
+
+```
+
+
+```{r}
+GDCdownload(query_rna)
+rna_se <- GDCprepare(query_rna)
+
+# Add 12-character patient ID
+colData(rna_se)$patient_id <- substr(colData(rna_se)$barcode, 1, 12)
+
+# Filter to only the clinical patients
+keep_idx <- colData(rna_se)$patient_id %in% patients
+rna_se <- rna_se[, keep_idx]
+
+saveRDS(rna_se, "RNASeq_SE_matched.rds")
+
+```
+
+
+
+
+```{r}
+## ================================
+## RNA-Seq: LUAD + LUSC (STAR - Counts)
+## Patient-matched to clinical cohort
+## ================================
+
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+
+## 1. Pick the clinical object -----------------------------------------
+if (exists("clinical_flat")) {
+  clinical_obj <- clinical_flat
+} else if (exists("clinical_all")) {
+  clinical_obj <- clinical_all
+} else {
+  stop("No clinical_flat or clinical_all object found. Run the clinical step first.")
+}
+
+# Ensure we have a patient_id column
+if (!"patient_id" %in% names(clinical_obj)) {
+  # try to derive it from submitter_id or bcr_patient_barcode
+  id_col <- intersect(c("submitter_id", "bcr_patient_barcode"), names(clinical_obj))[1]
+  if (is.na(id_col)) stop("Could not find submitter_id or bcr_patient_barcode in clinical object.")
+  clinical_obj$patient_id <- substr(clinical_obj[[id_col]], 1, 12)
+}
+
+patients <- clinical_obj$patient_id
+
+## 2. Define projects ---------------------------------------------------
+projects <- c("TCGA-LUAD", "TCGA-LUSC")
+
+## 3. Query RNA-Seq (STAR - Counts) ------------------------------------
+query_rna <- GDCquery(
+  project       = projects,
+  data.category = "Transcriptome Profiling",
+  data.type     = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts",   # your version only supports this
+  barcode       = patients           # only patients from clinical cohort
+)
+
+## 4. Download + prepare ------------------------------------------------
+GDCdownload(query_rna)
+rna_se <- GDCprepare(query_rna)   # SummarizedExperiment
+
+## 5. Add patient_id to colData ----------------------------------------
+# Make sure a barcode column exists in colData
+if (!"barcode" %in% names(colData(rna_se))) {
+  colData(rna_se)$barcode <- colnames(rna_se)
+}
+
+colData(rna_se)$patient_id <- substr(colData(rna_se)$barcode, 1, 12)
+
+## 6. Keep only samples from clinical patients --------------------------
+keep_idx <- colData(rna_se)$patient_id %in% patients
+rna_se <- rna_se[, keep_idx]
+
+## 7. (Optional) extract matrix + metadata ------------------------------
+rna_counts <- assay(rna_se)                  # genes x samples count matrix
+rna_meta   <- as.data.frame(colData(rna_se)) # sample metadata with patient_id, project, etc.
+
+## 8. Save for later steps ---------------------------------------------
+saveRDS(rna_se,     "RNASeq_SE_matched.rds")
+saveRDS(rna_counts, "RNASeq_counts_matrix.rds")
+saveRDS(rna_meta,   "RNASeq_metadata.rds")
+
+```
+
+
+
+
+```{r}
+## ================================
+## DNA Methylation: LUAD + LUSC
+## ================================
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+
+# 1. Use the same clinical object ----------------------------
+if (exists("clinical_flat")) {
+  clinical_obj <- clinical_flat
+} else if (exists("clinical_all")) {
+  clinical_obj <- clinical_all
+} else {
+  stop("No clinical_flat or clinical_all object found. Run the clinical step first.")
+}
+
+# Ensure patient_id exists
+if (!"patient_id" %in% names(clinical_obj)) {
+  id_col <- intersect(c("submitter_id", "bcr_patient_barcode"), names(clinical_obj))[1]
+  if (is.na(id_col)) stop("Could not find submitter_id or bcr_patient_barcode in clinical object.")
+  clinical_obj$patient_id <- substr(clinical_obj[[id_col]], 1, 12)
+}
+patients <- clinical_obj$patient_id
+
+projects <- c("TCGA-LUAD", "TCGA-LUSC")
+
+# 2. Query DNA methylation with explicit data.type -----------
+query_meth <- GDCquery(
+  project       = projects,
+  data.category = "DNA Methylation",
+  data.type     = "Methylation Beta Value",      # <-- key line
+  platform      = "Illumina Human Methylation 450",
+  barcode       = patients
+)
+
+# If this line errors and prints a different allowed data.type,
+# just replace "Methylation Beta Value" above with the one it suggests.
+
+# 3. Download + prepare --------------------------------------
+GDCdownload(query_meth)
+meth_se <- GDCprepare(query_meth)   # SummarizedExperiment
+
+# 4. Add patient_id and filter -------------------------------
+if (!"barcode" %in% names(colData(meth_se))) {
+  colData(meth_se)$barcode <- colnames(meth_se)
+}
+colData(meth_se)$patient_id <- substr(colData(meth_se)$barcode, 1, 12)
+
+keep_idx <- colData(meth_se)$patient_id %in% patients
+meth_se  <- meth_se[, keep_idx]
+
+saveRDS(meth_se, "Meth_SE_matched.rds")
+
+
+```
+
+
+
+
+```{r}
+# safer download with small chunks
+GDCdownload(
+  query_meth,
+  method         = "api",
+  files.per.chunk = 5   # or even 1 if it still fails
+)
+
+```
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+BiocManager::install(c("sesameData", "sesame"))
+
+```
+
+
+
+
+
+```{r}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+library(sesameData)  # loads annotation
+library(sesame)
+
+# 1) Build SummarizedExperiment from downloaded files
+meth_se <- GDCprepare(query_meth)
+
+# 2) Make sure clinical_obj + patients exist as before
+if (exists("clinical_flat")) {
+  clinical_obj <- clinical_flat
+} else if (exists("clinical_all")) {
+  clinical_obj <- clinical_all
+} else {
+  stop("No clinical_flat or clinical_all object found.")
+}
+
+if (!"patient_id" %in% names(clinical_obj)) {
+  id_col <- intersect(c("submitter_id", "bcr_patient_barcode"), names(clinical_obj))[1]
+  clinical_obj$patient_id <- substr(clinical_obj[[id_col]], 1, 12)
+}
+patients <- clinical_obj$patient_id
+
+# 3) Attach patient_id and filter to cohort
+if (!"barcode" %in% names(colData(meth_se))) {
+  colData(meth_se)$barcode <- colnames(meth_se)
+}
+colData(meth_se)$patient_id <- substr(colData(meth_se)$barcode, 1, 12)
+
+keep_idx <- colData(meth_se)$patient_id %in% patients
+meth_se  <- meth_se[, keep_idx]
+
+# 4) Save
+saveRDS(meth_se, "Meth_SE_matched.rds")
+
+
+```
+
+```{r}
+## ================================
+## STEP 4: Build final matched cohort & inspect WSI availability
+## ================================
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+
+projects <- c("TCGA-LUAD", "TCGA-LUSC")
+
+## 1. Clinical object ----------------------------------------
+if (exists("clinical_flat")) {
+  clinical_obj <- clinical_flat
+} else if (exists("clinical_all")) {
+  clinical_obj <- clinical_all
+} else {
+  stop("No clinical_flat or clinical_all object found.")
+}
+
+if (!"patient_id" %in% names(clinical_obj)) {
+  id_col <- intersect(c("submitter_id", "bcr_patient_barcode"), names(clinical_obj))[1]
+  clinical_obj$patient_id <- substr(clinical_obj[[id_col]], 1, 12)
+}
+clinical_patients <- unique(clinical_obj$patient_id)
+
+## 2. RNA object ---------------------------------------------
+if (!exists("rna_se")) {
+  rna_se <- readRDS("RNASeq_SE_matched.rds")
+}
+rna_patients <- unique(colData(rna_se)$patient_id)
+
+## 3. Methylation object -------------------------------------
+if (!exists("meth_se")) {
+  meth_se <- readRDS("Meth_SE_matched.rds")
+}
+meth_patients <- unique(colData(meth_se)$patient_id)
+
+## 4. WSI metadata for all clinical patients -----------------
+query_wsi_all <- GDCquery(
+  project       = projects,
+  data.category = "Biospecimen",
+  data.type     = "Slide Image",
+  barcode       = clinical_patients
+)
+
+wsi_meta_all <- getResults(query_wsi_all)
+wsi_meta_all$patient_id <- substr(wsi_meta_all$cases, 1, 12)
+wsi_patients <- unique(wsi_meta_all$patient_id)
+
+## 5. Final matched cohort -----------------------------------
+final_patients <- Reduce(intersect, list(
+  clinical_patients,
+  rna_patients,
+  meth_patients,
+  wsi_patients
+))
+
+length(final_patients)        # how many patients with ALL 4 modalities?
+head(final_patients)
+
+# Also see how many WSI files this corresponds to:
+wsi_meta_final <- wsi_meta_all %>% filter(patient_id %in% final_patients)
+nrow(wsi_meta_final)          # number of WSI files (can be > patients)
+table(wsi_meta_final$project) # LUAD vs LUSC slides
+
+# Save metadata for reference
+write.csv(wsi_meta_final, "WSI_metadata_final.csv", row.names = FALSE)
+```
+
+
+
+```{r}
+# Install if missing
+if (!requireNamespace("httr", quietly = TRUE)) {
+  install.packages("httr")
+}
+
+if (!requireNamespace("jsonlite", quietly = TRUE)) {
+  install.packages("jsonlite")
+}
+
+# Load them
+library(httr)
+library(jsonlite)
+
+```
+
+
+
+```{r}
+## ===========================================
+## One downsampled WSI (PNG) per patient
+## Uses GDC image endpoint, NOT full .svs files
+## ===========================================
+
+# ---- 0. Packages ----
+if (!requireNamespace("httr", quietly = TRUE)) {
+  install.packages("httr")
+}
+if (!requireNamespace("dplyr", quietly = TRUE)) {
+  install.packages("dplyr")
+}
+
+library(httr)
+library(dplyr)
+
+# ---- 1. Load WSI metadata for matched cohort ----
+# This is the file we saved earlier after building final_patients
+# If it's in another folder, adjust the path.
+wsi_meta_final <- read.csv("WSI_metadata_final.csv", stringsAsFactors = FALSE)
+
+# Ensure patient_id column exists (should already be there, but just in case)
+if (!"patient_id" %in% names(wsi_meta_final)) {
+  wsi_meta_final$patient_id <- substr(wsi_meta_final$cases, 1, 12)
+}
+
+# Optional: final_patients vector (if you need it elsewhere)
+final_patients <- unique(wsi_meta_final$patient_id)
+
+# ---- 2. Convert to plain data.frame & restrict to tumor slides (optional) ----
+wsi_df <- as.data.frame(wsi_meta_final)
+
+# If sample_type is present, keep only tumor slides
+if ("sample_type" %in% names(wsi_df)) {
+  tumor_types <- c("Primary Tumor", "Recurrent Tumor")
+  wsi_df <- wsi_df[wsi_df$sample_type %in% tumor_types, ]
+}
+
+# Order for deterministic selection (LUAD, then LUSC, etc.)
+wsi_df <- wsi_df[order(wsi_df$project, wsi_df$patient_id), ]
+
+# ---- 3. Choose ONE slide per patient ----
+# Keep the first row (slide) for each patient_id
+wsi_one <- wsi_df[!duplicated(wsi_df$patient_id), ]
+
+cat("Number of patients with selected WSIs:", nrow(wsi_one), "\n")
+print(table(wsi_one$project))
+
+# ---- 4. Download one downsampled image (level 4) per patient ----
+out_dir <- "TCGA_WSI_downsampled"
+dir.create(out_dir, showWarnings = FALSE)
+
+for (i in seq_len(nrow(wsi_one))) {
+  file_id <- wsi_one$file_id[i]
+  patient <- wsi_one$patient_id[i]
+
+  # GDC image endpoint: Level 4 downsampled image
+  url <- paste0(
+    "https://api.gdc.cancer.gov/data/",
+    file_id,
+    "?image=true&level=4"
+  )
+
+  out_file <- file.path(out_dir, paste0(patient, "_L4.png"))
+
+  if (!file.exists(out_file)) {
+    cat("Downloading:", patient, " (", i, "/", nrow(wsi_one), ")\n")
+    resp <- GET(url, write_disk(out_file, overwrite = TRUE))
+
+    # Simple check: status code
+    if (resp$status_code != 200) {
+      cat("  -> Warning: HTTP status", resp$status_code, "for", patient, "\n")
+    }
+  } else {
+    cat("Skipping (already exists):", patient, " (", i, "/", nrow(wsi_one), ")\n")
+  }
+}
+
+cat("Done. Images saved in folder:", out_dir, "\n")
+
+```
+
+
+
+```{r}
+## ===========================================
+## Robust downloader: one downsampled WSI (PNG) per patient
+## - Resumes automatically (skips existing files)
+## - Retries up to 3x on network/server errors
+## ===========================================
+if (!requireNamespace("httr", quietly = TRUE)) install.packages("httr")
+if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr")
+
+library(httr)
+library(dplyr)
+
+# ---- 1. Load metadata and build wsi_one --------------------
+wsi_meta_final <- read.csv("WSI_metadata_final.csv", stringsAsFactors = FALSE)
+
+if (!"patient_id" %in% names(wsi_meta_final)) {
+  wsi_meta_final$patient_id <- substr(wsi_meta_final$cases, 1, 12)
+}
+
+wsi_df <- as.data.frame(wsi_meta_final)
+
+# Optional: keep only tumor slides if sample_type exists
+if ("sample_type" %in% names(wsi_df)) {
+  tumor_types <- c("Primary Tumor", "Recurrent Tumor")
+  wsi_df <- wsi_df[wsi_df$sample_type %in% tumor_types, ]
+}
+
+# Order and pick ONE slide per patient
+wsi_df <- wsi_df[order(wsi_df$project, wsi_df$patient_id), ]
+wsi_one <- wsi_df[!duplicated(wsi_df$patient_id), ]
+
+cat("Total patients with at least one WSI:", nrow(wsi_one), "\n")
+print(table(wsi_one$project))
+
+# ---- 2. Figure out which patients are already downloaded ----
+out_dir <- "TCGA_WSI_downsampled"
+dir.create(out_dir, showWarnings = FALSE)
+
+existing_files <- list.files(out_dir, pattern = "_L4\\.png$", full.names = FALSE)
+existing_ids   <- sub("_L4\\.png$", "", existing_files)
+
+missing_idx <- which(!(wsi_one$patient_id %in% existing_ids))
+
+cat("Already downloaded:", length(existing_ids), "images\n")
+cat("Still missing:", length(missing_idx), "images\n")
+
+# ---- 3. Robust download loop with retries ------------------
+for (i in missing_idx) {
+  file_id <- wsi_one$file_id[i]
+  patient <- wsi_one$patient_id[i]
+
+  url <- paste0(
+    "https://api.gdc.cancer.gov/data/",
+    file_id,
+    "?image=true&level=4"
+  )
+
+  out_file <- file.path(out_dir, paste0(patient, "_L4.png"))
+
+  attempts <- 0
+  success  <- FALSE
+
+  while (!success && attempts < 3) {
+    attempts <- attempts + 1
+    cat("Downloading:", patient,
+        " (", i, "/", nrow(wsi_one), "), attempt", attempts, "\n")
+
+    resp <- tryCatch(
+      GET(url, timeout(300), write_disk(out_file, overwrite = TRUE)),
+      error = function(e) e
+    )
+
+    if (inherits(resp, "error") || resp$status_code != 200) {
+      # Something went wrong: network/GDC error
+      msg <- if (inherits(resp, "error")) resp$message else paste("HTTP", resp$status_code)
+      cat("  -> Download failed:", msg, "\n")
+
+      # Remove partial file if created
+      if (file.exists(out_file)) unlink(out_file)
+
+      if (attempts < 3) {
+        cat("  -> Retrying in 5 seconds...\n")
+        Sys.sleep(5)
+      } else {
+        cat("  -> Giving up on", patient, "after 3 attempts.\n")
+      }
+    } else {
+      success <- TRUE
+      cat("  -> Success.\n")
+    }
+  }
+}
+
+cat("Done. Images are in:", out_dir, "\n")
+
+
+```
+
+
+
+```{r}
+# Install BiocManager if you don't have it
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+# Install edgeR from Bioconductor
+BiocManager::install("edgeR")
+```
+
+
+
+
+```{r}
+library(edgeR)
+```
+
+
+
+```{r}
+# 1. Read the count matrix
+mat <- read.delim("rna_counts_filtered.tsv", row.names = 1, check.names = FALSE)
+
+# 2. Create DGEList
+dge <- DGEList(counts = mat)
+
+# 3. TMM normalization
+dge <- calcNormFactors(dge, method = "TMM")
+
+# Get CPM with log2(CPM+1)
+log_cpm <- cpm(
+  dge,
+  normalized.lib.sizes = TRUE,
+  log = TRUE,
+  prior.count = 1
+)
+
+write.table(
+  log_cpm,
+  file = "rna_logCPM_TMM.tsv",
+  sep = "\t",
+  quote = FALSE
+)
+```
+
+
+
+```{r}
+library(SummarizedExperiment)
+
+setwd("C:/Users/glori/Desktop/Lung-Cancer/Data")
+
+rna_se  <- readRDS("RNASeq_SE_matched.rds")
+meth_se <- readRDS("Meth_SE_matched.rds")
+
+rna_se
+meth_se
+```
+
+
+
+```{r}
+```
+
+
+
+```{r}
+# Get the main assay (if you have multiple assays, use assayNames() to check)
+assayNames(rna_se)
+assayNames(meth_se)
+
+rna_mat  <- t(assay(rna_se))      # samples × genes
+meth_mat <- t(assay(meth_se))     # samples × CpGs (M-values)
+
+dim(rna_mat)
+dim(meth_mat)
+
+head(rownames(rna_mat))
+head(rownames(meth_mat))
+
+```
+
+
+
+```{r}
+common_ids <- intersect(rownames(rna_mat), rownames(meth_mat))
+length(common_ids)
+
+rna_common  <- rna_mat[common_ids, , drop = FALSE]
+meth_common <- meth_mat[common_ids, , drop = FALSE]
+
+# check alignment
+stopifnot(all(rownames(rna_common) == rownames(meth_common)))
+```
+
+
+
+```{r}
+rna_ids  <- substr(rownames(rna_mat), 1, 12)
+meth_ids <- substr(rownames(meth_mat), 1, 12)
+
+# Add these as new rownames
+rownames(rna_mat)  <- rna_ids
+rownames(meth_mat) <- meth_ids
+```
+
+
+
+```{r}
+# In R
+library(SummarizedExperiment)
+
+# Load methylation data
+meth_se <- readRDS("C:/Users/glori/Desktop/Lung-Cancer/Data/Meth_SE_matched.rds")
+
+# Export beta values
+write.table(assay(meth_se), 
+            "C:/Users/glori/Desktop/Lung-Cancer/Data/meth_beta_values.tsv",
+            sep="\t", quote=FALSE, row.names=TRUE, col.names=TRUE)
+
+# Export sample metadata
+write.csv(colData(meth_se), 
+          "C:/Users/glori/Desktop/Lung-Cancer/Data/meth_sample_metadata.csv")
+
+# Export probe/CpG metadata
+write.csv(rowData(meth_se), 
+          "C:/Users/glori/Desktop/Lung-Cancer/Data/meth_probe_metadata.csv")
+```
+
+
+
+```{r}
+```
